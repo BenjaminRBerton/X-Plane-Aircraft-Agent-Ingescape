@@ -23,7 +23,7 @@ from joystick_handler import JoystickHandler
 
 # ============= Configuration =============
 JOYSTICK_VERBOSE = True  # Set to True to see detailed joystick button press/release logs
-PTT_LONG_PRESS_TIME = 0.5  # Time in seconds to hold button for PTT activation
+PTT_LONG_PRESS_TIME = 0.3  # Time in seconds to hold button for PTT activation
 CLICK_SOUND_VOLUME = 1.0  # Volume for the click sound (0.0 = silent, 1.0 = full volume)
 # Joystick-specific smart button index (button with PTT/check/approve logic)
 # Yoko+ uses button 5; Extreme 3D Pro uses button 0 (trigger)
@@ -105,6 +105,7 @@ exterior_lights_dref = "Mustang/cockpit/lighting/taxi_landing" # 0 is off, 1 is 
 anti_coll_lights_dref = "sim/cockpit/electrical/strobe_lights_on" # 0 is off, 1 is on
 load_situation_2_comm = "sim/operation/load_situation_2" 
 load_situation_1_comm = "sim/operation/load_situation_1" 
+load_situation_3_comm = "sim/operation/load_situation_3"
 pause_toggle_comm = "sim/operation/pause_toggle"
 pause_dref = "sim/time/paused"  # 0 = running, 1 = paused
 botle_r_arm_dref = "Mustang/cockpit/bottle_r_arm_b" # 0 is off, 1 is on
@@ -115,6 +116,9 @@ yoke_hide_dref = "Mustang/cockpit/yoke_hide" # 0 is show, 1 is hide
 speed_brake_dref = "sim/cockpit2/controls/speedbrake_ratio"
 autopilot_airspeed_dref = "sim/cockpit/autopilot/airspeed" # airspeed set in the autopilot
 com_1_freq_dref = "sim/cockpit/radios/com1_freq_hz" #11980 is 119.80 MHz, multiply by 100 to get the value in Hz that X-Plane uses
+wind_direction_degt_dref = "sim/weather/wind_direction_degt[0]" # wind direction from 0 to 359 degrees TRUE heading - not magnetic
+wind_speed_kt_dref = "sim/weather/wind_speed_kt[0]" # wind speed in knots
+airspeedmach_dref = "Mustang/airspeedmach" # 0 is airspeed in knots, 1 is mach number - this is a custom dref that the mustang plugin uses to report airspeed in the correct unit based on the speed mode (ias or mach)
 
 """
 		a.observeInput("alarm", agentCB);
@@ -147,6 +151,10 @@ checklist_check_time = None  # Scheduled time (epoch) to run initial config chec
 checklist_active = False      # True while sim is paused waiting for correct initial config
 checklist_last_failures = set()  # Track last printed failures to avoid spamming
 _checklist_queue = _queue_module.Queue()  # Thread-safe channel → ChecklistWindow
+elite_hrv_entered = False    # True when Elite HRV time has been entered for this session
+eye_tracking_running = False  # Track if eye tracking is running
+last_record_progress = 0.0    # Track last record_progress value to detect if it's increasing
+record_progress_stagnant_time = None  # Time when record progress stopped increasing
 
 def signal_handler(signal_received, frame):
     global is_interrupted, joystick_handler, g1000_mfd_handler, g1000_pfd_handler
@@ -176,7 +184,7 @@ _IGS_EVENT_NAMES = {
 
 def on_agent_event_callback(event, uuid, name, event_data, my_data):
     event_name = _IGS_EVENT_NAMES.get(event, f"UNKNOWN({event})")
-    print(f"[INGESCAPE] {event_name} - agent: {name} ({uuid}) - data: {event_data}")
+    # print(f"[INGESCAPE] {event_name} - agent: {name} ({uuid}) - data: {event_data}")
     agent_object = my_data
     assert isinstance(agent_object, Echo)
     # add code here if needed
@@ -187,10 +195,14 @@ def on_freeze_callback(is_frozen, my_data):
     # add code here if needed
 
 def bool_input_callback(io_type, name, value_type, value, my_data):
+    global eye_tracking_running
     if name == "On_Off":
         if value:
             print("On_Off triggered - sending all outputs...")
             send_all_outputs()
+    elif name == "eye_tracking_running":
+        eye_tracking_running = value
+        print(f"[EYE TRACKING] Eye tracking running status: {value}")
     elif name == "yaw_damper":
         send_dref(yaw_damper_dref, value)
     elif name == "l_ign_switch":
@@ -213,13 +225,24 @@ def bool_input_callback(io_type, name, value_type, value, my_data):
         send_dref(anti_coll_lights_dref, int(value))
     elif name == "yoke_hide":
         send_dref(yoke_hide_dref, int(value))
+        if value:
+            send_dref(speed_brake_dref, 0)
     elif name == "brake":
         send_dref(parkBrake_dref, 1 if value else 0)
     elif name == "gear":
         set_control_inputs("gear", 1 if value else 0)
 
 def double_input_callback(io_type, name, value_type, value, my_data):
-    if name == "elevator":
+    global last_record_progress, record_progress_stagnant_time
+    if name == "record_progress":
+        if value > last_record_progress:
+            # Progress is increasing, reset stagnant timer
+            record_progress_stagnant_time = None
+        elif record_progress_stagnant_time is None and last_record_progress > 0:
+            # Progress stopped increasing, start timer
+            record_progress_stagnant_time = time.time()
+        last_record_progress = value
+    elif name == "elevator":
         set_control_inputs("elevator", value)
     elif name == "rudder":
         set_control_inputs("rudder", value)
@@ -260,6 +283,10 @@ def double_input_callback(io_type, name, value_type, value, my_data):
         send_dref(aileron_trim_dref, value)
     elif name == "fd_pitch_deg":
         send_dref(fd_pitch_deg_dref, value)
+    elif name == "wind_direction":
+        send_dref(wind_direction_degt_dref, value)
+    elif name == "wind_speed":
+        send_dref(wind_speed_kt_dref, value)
 
 def int_input_callback(io_type, name, value_type, value, my_data):
     if name == "test_knob":
@@ -275,9 +302,9 @@ def int_input_callback(io_type, name, value_type, value, my_data):
     elif name == "autopilot_heading_set":
         send_dref(heading_sel_dref, value)
     elif name == "fuel_boost_l":
-        send_dref(fuel_boost_l_dref, value + 1)
+        send_dref(fuel_boost_l_dref, value)
     elif name == "fuel_boost_r":
-        send_dref(fuel_boost_r_dref, value + 1)
+        send_dref(fuel_boost_r_dref, value)
     elif name == "pax_safety":
         send_dref(pax_safety_dref, int(value))
     elif name == "exterior_lights":
@@ -286,7 +313,8 @@ def int_input_callback(io_type, name, value_type, value, my_data):
         send_dref(com_1_freq_dref, value)
         
 def impulsion_input_callback(io_type, name, value_type, value, my_data):
-    global neverDone, reset_time, outputs_initialized, checklist_check_time, checklist_active
+    global neverDone, reset_time, outputs_initialized, checklist_check_time, checklist_active, elite_hrv_entered
+    global last_record_progress, record_progress_stagnant_time
     if name == "reset":
         print("Resetting simulation...")
         neverDone = True
@@ -296,6 +324,9 @@ def impulsion_input_callback(io_type, name, value_type, value, my_data):
         outputs_initialized = False  # Mark that outputs need to be re-initialized
         checklist_check_time = reset_time + 8  # Schedule config check 8s after reset
         checklist_active = False  # Cancel any in-progress checklist
+        elite_hrv_entered = False  # Reset Elite HRV flag
+        last_record_progress = 0.0  # Reset record progress tracking
+        record_progress_stagnant_time = None
 
     elif name == "clear_m_w":
         send_comm(clear_master_warning_comm)
@@ -310,6 +341,7 @@ def impulsion_input_callback(io_type, name, value_type, value, my_data):
     elif name == "heading_mode":
         send_comm(heading_mode_comm)
     elif name == "speed_mode":
+        send_dref(airspeedmach_dref, 1)
         send_comm(speed_mode_comm)
     elif name == "heading_mode":
         send_comm(heading_mode_comm)
@@ -325,6 +357,36 @@ def impulsion_input_callback(io_type, name, value_type, value, my_data):
         send_comm(vertical_speed_up_comm)
     elif name == "pause":
         send_comm(pause_toggle_comm)
+
+def string_input_callback(io_type, name, value_type, value, my_data):
+    global neverDone, reset_time, outputs_initialized, checklist_check_time, checklist_active, elite_hrv_entered
+    global last_record_progress, record_progress_stagnant_time
+    if name == "eliteHRV":
+        elite_hrv_entered = True
+        agent.elite_hrv_o = value
+        print(f"[ELITE HRV] Time entered: {value}")
+    elif name == "load_situation":
+        if value == "06R":
+            print(f"Loading situation 06R...")
+            send_comm(load_situation_1_comm)
+        elif value == "24L":
+            print(f"Loading situation 24L...")
+            send_comm(load_situation_2_comm)
+        elif value == "24R":
+            print(f"Loading situation 24R...")
+            send_comm(load_situation_3_comm)
+        else:
+            print(f"Unknown runway designation: {value}")
+            return
+        
+        # Trigger reset behavior (config checklist check)
+        neverDone = True
+        agent.outside_event_o = f"LOAD_{value}"
+        reset_time = time.time()  # Record the time of reset
+        outputs_initialized = False  # Mark that outputs need to be re-initialized
+        checklist_check_time = reset_time + 8  # Schedule config check 8s after load
+        checklist_active = False  # Cancel any in-progress checklist
+        elite_hrv_entered = False  # Reset Elite HRV flag
 
 def get_dref(arg, is_double=False):
     try:
@@ -489,6 +551,8 @@ igs.input_create("r_windshield_anti_ice", igs.BOOL_T, None)  # 0 is off, 1 is on
 igs.input_create("exterior_lights", igs.INTEGER_T, None)  # 0 is off, 1 is taxi, 2 is landing
 igs.input_create("anti_coll_lights", igs.BOOL_T, None)  # 0 is off, 1 is on
 igs.input_create("com_1_freq", igs.INTEGER_T, None)  # COM1 frequency in Hz (e.g. 11980 = 119.80 MHz)
+igs.input_create("wind_direction", igs.DOUBLE_T, None)  # wind direction from 0 to 359 degrees TRUE heading
+igs.input_create("wind_speed", igs.DOUBLE_T, None)  # wind speed in knots
 igs.input_create("On_Off", igs.BOOL_T, None)  # Toggle to send all outputs
 igs.input_create("clear_m_w", igs.IMPULSION_T, None)
 igs.input_create("clear_m_c", igs.IMPULSION_T, None)
@@ -502,6 +566,10 @@ igs.input_create("yoke_hide", igs.BOOL_T, None)  # 0 is show, 1 is hide
 igs.input_create("nose_down", igs.IMPULSION_T, None)
 igs.input_create("nose_up", igs.IMPULSION_T, None)
 igs.input_create("pause", igs.IMPULSION_T, None)
+igs.input_create("load_situation", igs.STRING_T, None)  # runway designation: "24R", "24L", "06R"
+igs.input_create("eliteHRV", igs.STRING_T, None)  # Elite HRV time entry for checklist
+igs.input_create("record_progress", igs.DOUBLE_T, None)  # Number of seconds since recording began
+igs.input_create("eye_tracking_running", igs.BOOL_T, None)  # Eye tracking status
 
 igs.output_create("airspeed", igs.DOUBLE_T, None)
 igs.output_create("pitch", igs.DOUBLE_T, None)
@@ -570,6 +638,9 @@ igs.output_create("approve", igs.BOOL_T, None)  # Smart button triple-click
 igs.output_create("yoke_hide", igs.BOOL_T, None)  # 0 is show, 1 is hide
 igs.output_create("autopilot_airspeed", igs.DOUBLE_T, None)  # airspeed set in the autopilot
 igs.output_create("com_1_freq", igs.INTEGER_T, None)  # COM1 frequency in Hz (e.g. 11980 = 119.80 MHz)
+igs.output_create("wind_direction", igs.DOUBLE_T, None)  # wind direction from 0 to 359 degrees TRUE heading
+igs.output_create("wind_speed", igs.DOUBLE_T, None)  # wind speed in knots
+igs.output_create("eliteHRV", igs.STRING_T, None)  # Elite HRV time recorded
 igs.output_create("paused", igs.BOOL_T, None)  # true = sim paused, false = sim running
 
 igs.observe_input("On_Off", bool_input_callback, None)  # Observe On_Off toggle
@@ -610,6 +681,8 @@ igs.observe_input("r_windshield_anti_ice", bool_input_callback, None)  # 0 is of
 igs.observe_input("exterior_lights", int_input_callback, None)  # 0 is off, 1 is taxi, 2 is landing
 igs.observe_input("anti_coll_lights", bool_input_callback, None)  # 0 is off, 1 is on
 igs.observe_input("com_1_freq", int_input_callback, None)  # COM1 frequency in Hz
+igs.observe_input("wind_direction", double_input_callback, None)  # wind direction in degrees true
+igs.observe_input("wind_speed", double_input_callback, None)  # wind speed in knots
 igs.observe_input("trim_rudder", double_input_callback, None)
 igs.observe_input("elevator_trim", double_input_callback, None)
 igs.observe_input("aileron_trim", double_input_callback, None)
@@ -622,6 +695,10 @@ igs.observe_input("yoke_hide", bool_input_callback, None)  # 0 is show, 1 is hid
 igs.observe_input("nose_down", impulsion_input_callback, None)
 igs.observe_input("nose_up", impulsion_input_callback, None)
 igs.observe_input("pause", impulsion_input_callback, None)
+igs.observe_input("load_situation", string_input_callback, None)
+igs.observe_input("eliteHRV", string_input_callback, None)
+igs.observe_input("record_progress", double_input_callback, None)
+igs.observe_input("eye_tracking_running", bool_input_callback, None)
 
 igs.log_set_console(True)
 igs.log_set_console_level(igs.LOG_INFO)
@@ -664,10 +741,15 @@ try:
     click_sound = pygame.mixer.Sound(_sound_path)
     click_sound.set_volume(CLICK_SOUND_VOLUME)
     print(f"Click sound loaded: {_sound_path}")
+    _stt_listening_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sound", "stt_listening.mp3")
+    stt_listening_sound = pygame.mixer.Sound(_stt_listening_path)
+    stt_listening_sound.set_volume(CLICK_SOUND_VOLUME)
+    print(f"STT listening sound loaded: {_stt_listening_path}")
     _alarm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sound", "fire_alarm_bell.mp3")
     print(f"Fire alarm sound path set: {_alarm_path}")
 except Exception as e:
     click_sound = None
+    stt_listening_sound = None
     _alarm_path = None
     print(f"Warning: could not load sounds: {e}")
 
@@ -730,7 +812,7 @@ class Button5Handler:
         
         # If PTT was activated, deactivate it on release
         if self.is_ptt_active:
-            print("🎙️  PTT - DEACTIVATED")
+            print("[PTT] DEACTIVATED")
             igs.output_set_bool("ptt", False)
             self.is_ptt_active = False
             return
@@ -752,7 +834,12 @@ class Button5Handler:
     def _activate_ptt(self):
         """Activate PTT after button has been held for long_press_threshold."""
         if self.press_start_time is not None:  # Button still held
-            print("🎙️  PTT - ACTIVATED (long press detected)")
+            print("[PTT] ACTIVATED (long press detected)")
+            if stt_listening_sound:
+                stt_listening_sound.play()
+                # Wait for the sound to finish before activating PTT signal
+                sound_duration = stt_listening_sound.get_length()
+                time.sleep(sound_duration)
             igs.output_set_bool("ptt", True)
             self.is_ptt_active = True
     
@@ -761,10 +848,10 @@ class Button5Handler:
         click_count = len(self.click_times)
         
         if click_count == 2:
-            print("✓✓ CHECKED (double-click detected)")
+            print("[CHECK] CHECKED (double-click detected)")
             igs.output_set_impulsion("check")
         elif click_count >= 3:
-            print("✓✓✓ APPROVE (triple-click detected)")
+            print("[APPROVE] APPROVE (triple-click detected)")
             igs.output_set_bool("approve", True)
         # Single click - do nothing special
         
@@ -849,7 +936,7 @@ if joystick_handler.initialize():
             joystick_handler.register_button_press(button_num, button5_handler.on_press)
             joystick_handler.register_button_release(button_num, button5_handler.on_release)
         elif button_num == 0:
-            # Button 0 is PTT-ATC (only if it is not already the smart button)
+            # Button 0 is PTT-ATC: True on press, False on release (only if not the smart button)
             print(f"  Button 0 -> PTT-ATC handler (ptt_atc)")
             joystick_handler.register_button_press(0, _ptt_atc_press)
             joystick_handler.register_button_release(0, _ptt_atc_release)
@@ -895,8 +982,8 @@ def _alt_sel_adjust(delta_ft: int):
     current_ft = round(current[0] * 100)          # ×100 ft → ft
     new_ft = max(0, min(45000, current_ft + delta_ft))
     send_dref(alt_sel_dref, new_ft / 100)
-    igs.output_set_integer("alt_sel", new_ft)
-    print(f"[ALT SEL] {current_ft} ft → {new_ft} ft (Δ{delta_ft:+d} ft)")
+    igs.output_set_int("alt_sel", new_ft)
+    print(f"[ALT SEL] {current_ft} ft -> {new_ft} ft ({delta_ft:+d} ft)")
 
 def _make_alt_knob_handler(panel: str, btn: int):
     label, delta = _ALT_KNOB_BUTTONS[btn]
@@ -933,6 +1020,57 @@ if pfd_index is not None:
         g1000_pfd_handler = None
 else:
     print("Virtual Fly G1000 PFD not found - skipping PFD integration.")
+
+# ============= G1000 Nose-Up / Nose-Down Button Integration =============
+# Reads nose_button_config.json (produced by remap_nose_buttons.py).
+# Each press sends the same X-Plane command as the ingescape nose_up / nose_down inputs:
+#   nose up   → vertical_speed_up_comm   ("sim/autopilot/vertical_speed_up")
+#   nose down → vertical_speed_down_comm ("sim/autopilot/vertical_speed_down")
+
+import json as _json
+
+_NOSE_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nose_button_config.json")
+
+def _load_nose_config():
+    if not os.path.exists(_NOSE_CFG_PATH):
+        print("[NOSE BTN] nose_button_config.json not found — run remap_nose_buttons.py first.")
+        return None
+    try:
+        with open(_NOSE_CFG_PATH) as _f:
+            cfg = _json.load(_f)
+        required = {"pfd_nose_up_button", "pfd_nose_down_button",
+                    "mfd_nose_up_button", "mfd_nose_down_button"}
+        if not required.issubset(cfg):
+            print("[NOSE BTN] nose_button_config.json is incomplete — re-run remap_nose_buttons.py.")
+            return None
+        return cfg
+    except Exception as _e:
+        print(f"[NOSE BTN] Failed to load nose_button_config.json: {_e}")
+        return None
+
+_nose_cfg = _load_nose_config()
+
+if _nose_cfg is not None:
+    def _make_nose_handler(panel: str, direction: str):
+        comm = vertical_speed_up_comm if direction == "up" else vertical_speed_down_comm
+        label = "NOSE UP" if direction == "up" else "NOSE DOWN"
+        def _handler():
+            print(f"[G1000 {panel}] {label} -> {comm}")
+            send_comm(comm)
+        return _handler
+
+    # Register on MFD handler if it is running
+    if g1000_mfd_handler is not None:
+        g1000_mfd_handler.register_button_press(_nose_cfg["mfd_nose_up_button"],   _make_nose_handler("MFD", "up"))
+        g1000_mfd_handler.register_button_press(_nose_cfg["mfd_nose_down_button"], _make_nose_handler("MFD", "down"))
+        print(f"[NOSE BTN] MFD nose up=#{_nose_cfg['mfd_nose_up_button']}  nose down=#{_nose_cfg['mfd_nose_down_button']} registered.")
+
+    # Register on PFD handler if it is running
+    if g1000_pfd_handler is not None:
+        g1000_pfd_handler.register_button_press(_nose_cfg["pfd_nose_up_button"],   _make_nose_handler("PFD", "up"))
+        g1000_pfd_handler.register_button_press(_nose_cfg["pfd_nose_down_button"], _make_nose_handler("PFD", "down"))
+        print(f"[NOSE BTN] PFD nose up=#{_nose_cfg['pfd_nose_up_button']}  nose down=#{_nose_cfg['pfd_nose_down_button']} registered.")
+
 # ============= End G1000 ALT Selector Integration =============
 
 
@@ -1038,9 +1176,26 @@ class ChecklistWindow:
 
 
 def _get_checklist_failures():
+    global record_progress_stagnant_time
+    failures = set()
+    
+    # ⚠⚠⚠ ELITE HRV CHECK - MUST BE FIRST ⚠⚠⚠
+    if not elite_hrv_entered:
+        failures.add("ENTER ELITE HRV TIME")
+    
+    # Eye tracking status check
+    if not eye_tracking_running:
+        failures.add("START EYE TRACKING")
+    
+    # Recording progress check - only flag if stagnant for more than 3 seconds
+    if record_progress_stagnant_time is not None:
+        if time.time() - record_progress_stagnant_time > 3.0:
+            failures.add("RECORDING NOT PROGRESSING")
+    
+    # Standard aircraft configuration checks
     checks = [
-        ('l_ign_switch',          getattr(agent, '_l_ign_switch_o', None),          True,  'L ignition ON'),
-        ('r_ign_switch',          getattr(agent, '_r_ign_switch_o', None),          True,  'R ignition ON'),
+        ('l_ign_switch',          getattr(agent, '_l_ign_switch_o', None),          False,  'L ignition → OFF'),
+        ('r_ign_switch',          getattr(agent, '_r_ign_switch_o', None),          False,  'R ignition → OFF'),
         ('l_gen_switch',          getattr(agent, '_l_gen_switch_o', None),          2,     'L generator → ON (2)'),
         ('r_gen_switch',          getattr(agent, '_r_gen_switch_o', None),          2,     'R generator → ON (2)'),
         ('pax_safety',            getattr(agent, '_pax_safety_o', None),            0,     'Pax safety → OFF (0)'),
@@ -1054,8 +1209,12 @@ def _get_checklist_failures():
         ('park_brake',            getattr(agent, '_park_brake_o', None),            True,  'Parking brake → ON'),
         ('control_gear',          getattr(agent, '_control_gear_o', None),          1.0,   'Landing gear → DOWN (1)'),
         ('control_flaps',         getattr(agent, '_control_flaps_o', None),         0.0,   'Flaps → 0'),
+        ('l_fuel_boost',          getattr(agent, '_fuel_boost_l_o', None),          0,     'L fuel boost → NORM (0)'),
+        ('r_fuel_boost',          getattr(agent, '_fuel_boost_r_o', None),          0,     'R fuel boost → NORM (0)'),
     ]
-    return {label for _, val, expected, label in checks if val != expected}
+    failures.update({label for _, val, expected, label in checks if val != expected})
+    
+    return failures
 
 
 def _initial_config_ok():
@@ -1130,6 +1289,8 @@ def _collect_output_values():
         'yoke_hide': getattr(agent, '_yoke_hide_o', None),
         'autopilot_airspeed': getattr(agent, '_autopilot_airspeed_o', None),
         'com_1_freq': getattr(agent, '_com_1_freq_o', None),
+        'wind_direction': getattr(agent, '_wind_direction_o', None),
+        'wind_speed': getattr(agent, '_wind_speed_o', None),
         'paused': getattr(agent, '_paused_o', None),
     }
 
@@ -1205,6 +1366,8 @@ def _push_output_values(output_values):
     if output_values['yoke_hide'] is not None: agent.yoke_hide_o = output_values['yoke_hide']
     if output_values['autopilot_airspeed'] is not None: agent.autopilot_airspeed_o = output_values['autopilot_airspeed']
     if output_values['com_1_freq'] is not None: agent.com_1_freq_o = output_values['com_1_freq']
+    if output_values['wind_direction'] is not None: agent.wind_direction_o = output_values['wind_direction']
+    if output_values['wind_speed'] is not None: agent.wind_speed_o = output_values['wind_speed']
     if output_values['paused'] is not None: agent.paused_o = output_values['paused']
 
 
@@ -1256,7 +1419,7 @@ def main(BirdStrikeEnabled=True):
             while not is_interrupted:
                 time.sleep(refresh_rate)
 
-                airspeed, vert_speed, park_brake, mustang_l_throttle, mustang_r_throttle, n1_match_bug, n1_percent, slip, engine_fires, pax_safety, master_warning, master_caution, flight_director, speed_mode, heading_mode, fuel_boost_l, fuel_boost_r, test_knob, autopilot_heading_set, yaw_damper, l_ign_switch, r_ign_switch, l_gen_switch, r_gen_switch, transfer_knob, baro_setting, cabin_altitude, gen_load, pitot_heat, l_windshield_anti_ice, r_windshield_anti_ice, exterior_lights, anti_coll_lights, engine_anti_ice, trim_rudder, alt_sel, heading_sel, l_bottle_arm, r_bottle_arm, yoke_hide, autopilot_airspeed, com_1_freq, altitude_raw, heading_raw, elevator_trim, aileron_trim, fd_pitch_deg, paused = get_drefs([ias_dref, verticalSpeed_dref, parkBrake_dref, mustang_l_throttle_dref, mustang_r_throttle_dref, n1_match_bug_dref, n1_percent_dref, slip_dref, engine_fires_dref, pax_safety_dref, master_warning_dref, master_caution_dref, flight_director_dref, speed_mode_dref, heading_mode_dref, fuel_boost_l_dref, fuel_boost_r_dref, test_knob_dref, heading_sel_dref, yaw_damper_dref, l_ign_switch_dref, r_ign_switch_dref, l_gen_switch_dref, r_gen_switch_dref, transfer_knob_dref, baro_setting_dref, cabin_altitude_dref, gen_load_dref, pitot_heat_dref, l_windshield_anti_ice_dref, r_windshield_anti_ice_dref, exterior_lights_dref, anti_coll_lights_dref, anti_ice_engine_dref, trim_rudder_dref, alt_sel_dref, heading_sel_dref, botle_l_arm_dref, botle_r_arm_dref, yoke_hide_dref, autopilot_airspeed_dref, com_1_freq_dref, altitude_dref, heading_dref, elevator_trim_dref, aileron_trim_dref, fd_pitch_deg_dref, pause_dref])
+                airspeed, vert_speed, park_brake, mustang_l_throttle, mustang_r_throttle, n1_match_bug, n1_percent, slip, engine_fires, pax_safety, master_warning, master_caution, flight_director, speed_mode, heading_mode, fuel_boost_l, fuel_boost_r, test_knob, autopilot_heading_set, yaw_damper, l_ign_switch, r_ign_switch, l_gen_switch, r_gen_switch, transfer_knob, baro_setting, cabin_altitude, gen_load, pitot_heat, l_windshield_anti_ice, r_windshield_anti_ice, exterior_lights, anti_coll_lights, engine_anti_ice, trim_rudder, alt_sel, heading_sel, l_bottle_arm, r_bottle_arm, yoke_hide, autopilot_airspeed, com_1_freq, altitude_raw, heading_raw, elevator_trim, aileron_trim, fd_pitch_deg, wind_direction, wind_speed, paused = get_drefs([ias_dref, verticalSpeed_dref, parkBrake_dref, mustang_l_throttle_dref, mustang_r_throttle_dref, n1_match_bug_dref, n1_percent_dref, slip_dref, engine_fires_dref, pax_safety_dref, master_warning_dref, master_caution_dref, flight_director_dref, speed_mode_dref, heading_mode_dref, fuel_boost_l_dref, fuel_boost_r_dref, test_knob_dref, heading_sel_dref, yaw_damper_dref, l_ign_switch_dref, r_ign_switch_dref, l_gen_switch_dref, r_gen_switch_dref, transfer_knob_dref, baro_setting_dref, cabin_altitude_dref, gen_load_dref, pitot_heat_dref, l_windshield_anti_ice_dref, r_windshield_anti_ice_dref, exterior_lights_dref, anti_coll_lights_dref, anti_ice_engine_dref, trim_rudder_dref, alt_sel_dref, heading_sel_dref, botle_l_arm_dref, botle_r_arm_dref, yoke_hide_dref, autopilot_airspeed_dref, com_1_freq_dref, altitude_dref, heading_dref, elevator_trim_dref, aileron_trim_dref, fd_pitch_deg_dref, wind_direction_degt_dref, wind_speed_kt_dref, pause_dref])
 
                 agent.airspeed_o = airspeed[0]
                 
@@ -1342,6 +1505,8 @@ def main(BirdStrikeEnabled=True):
                 agent.yoke_hide_o = bool(yoke_hide[0])
                 agent.autopilot_airspeed_o = autopilot_airspeed[0]
                 agent.com_1_freq_o = int(com_1_freq[0])
+                agent.wind_direction_o = wind_direction[0]
+                agent.wind_speed_o = wind_speed[0]
                 agent.paused_o = bool(paused[0])
 
                 time.sleep(refresh_rate)
@@ -1362,7 +1527,8 @@ def main(BirdStrikeEnabled=True):
                     if failures:
                         checklist_last_failures = failures
                         _checklist_queue.put({"type": "show", "failures": failures})
-                        send_comm(pause_toggle_comm)
+                        if not paused[0]:
+                            send_comm(pause_toggle_comm)
                         checklist_active = True
                     else:
                         print("[CHECKLIST] Initial config OK - no pause needed")
@@ -1390,6 +1556,8 @@ def main(BirdStrikeEnabled=True):
                 if now - last_full_sync >= FULL_SYNC_INTERVAL:
                     print("[SYNC] Periodic full output resync")
                     resync_igs_outputs()
+                    if yoke_hide[0] == 0:
+                        send_dref(yoke_hide_dref, 1)
                     last_full_sync = now
         except BaseException as e:
             print(f"[ERROR] An error occurred: {type(e).__name__}: {e}")

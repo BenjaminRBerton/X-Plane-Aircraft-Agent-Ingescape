@@ -107,6 +107,9 @@ class Echo(metaclass=Singleton):
         self.elevator_trim_o = None
         self.aileron_trim_o = None
         self.fd_pitch_deg_o = None
+        self.wind_direction_o = None
+        self.wind_speed_o = None
+        self.elite_hrv_o = None
         self.paused_o = None
 
     @property
@@ -840,6 +843,28 @@ class Echo(metaclass=Singleton):
             igs.output_set_int("com_1_freq", self._com_1_freq_o)
 
     @property
+    def wind_direction_o(self):
+        return self._wind_direction_o
+    @wind_direction_o.setter
+    def wind_direction_o(self, value):
+        if hasattr(self, '_wind_direction_o') and self._wind_direction_o == value:
+            return
+        self._wind_direction_o = value
+        if self._wind_direction_o is not None:
+            igs.output_set_double("wind_direction", self._wind_direction_o)
+
+    @property
+    def wind_speed_o(self):
+        return self._wind_speed_o
+    @wind_speed_o.setter
+    def wind_speed_o(self, value):
+        if hasattr(self, '_wind_speed_o') and self._wind_speed_o == value:
+            return
+        self._wind_speed_o = value
+        if self._wind_speed_o is not None:
+            igs.output_set_double("wind_speed", self._wind_speed_o)
+
+    @property
     def elevator_trim_o(self):
         return self._elevator_trim_o
     @elevator_trim_o.setter
@@ -882,6 +907,16 @@ class Echo(metaclass=Singleton):
         self._paused_o = value
         if self._paused_o is not None:
             igs.output_set_bool("paused", self._paused_o)
+
+    @property
+    def elite_hrv_o(self):
+        return self._elite_hrv_o
+    @elite_hrv_o.setter
+    def elite_hrv_o(self, value):
+        # Transparent pass-through - always send output (no caching)
+        self._elite_hrv_o = value
+        if self._elite_hrv_o is not None:
+            igs.output_set_string("eliteHRV", self._elite_hrv_o)
 
     # =========================================================================
 
