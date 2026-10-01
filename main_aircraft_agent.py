@@ -132,7 +132,7 @@ com_1_freq_dref = "sim/cockpit/radios/com1_freq_hz" #11980 is 119.80 MHz, multip
 refresh_rate = 0.05  # 20 Hz — gives ingescape's background thread regular GIL access
 port = 5670
 agent_name = "Aircraft"
-device = "Ethernet"  # Will be overridden by the startup fallback logic below
+device = "Wi-Fi"  # Will be overridden by the startup fallback logic below
 verbose = False
 is_interrupted = False
 start_heading = None
@@ -843,16 +843,16 @@ if joystick_handler.initialize():
             print(f"[JOYSTICK] Button 0 (#0) - RELEASED")
         igs.output_set_bool("ptt_atc", False)
     for button_num in range(joy_info['num_buttons']):
-        if button_num == 0:
-            # Button 0 is always PTT-ATC: True on press, False on release
-            print(f"  Button 0 -> PTT-ATC handler (ptt_atc)")
-            joystick_handler.register_button_press(0, _ptt_atc_press)
-            joystick_handler.register_button_release(0, _ptt_atc_release)
-        elif button_num == smart_button:
+        if button_num == smart_button:
             # Use special handler for the smart button (PTT / check / approve)
             print(f"  Button {button_num} -> Smart handler (PTT/check/approve)")
             joystick_handler.register_button_press(button_num, button5_handler.on_press)
             joystick_handler.register_button_release(button_num, button5_handler.on_release)
+        elif button_num == 0:
+            # Button 0 is PTT-ATC (only if it is not already the smart button)
+            print(f"  Button 0 -> PTT-ATC handler (ptt_atc)")
+            joystick_handler.register_button_press(0, _ptt_atc_press)
+            joystick_handler.register_button_release(0, _ptt_atc_release)
         else:
             joystick_handler.register_button_press(button_num, create_button_press_handler(button_num))
             joystick_handler.register_button_release(button_num, create_button_release_handler(button_num))
