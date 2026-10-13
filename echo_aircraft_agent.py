@@ -46,6 +46,9 @@ class Echo(metaclass=Singleton):
         self.altitude_o = None
         self.latitude_o = None
         self.longitude_o = None
+        self.current_runway_o = None
+        self.runway_centerline_deviation_o = None
+        self.heading_deviation_o = None
         self.control_pitch_o = None
         self.control_roll_o = None
         self.control_yaw_o = None
@@ -54,6 +57,7 @@ class Echo(metaclass=Singleton):
         self.control_gear_o = None
         self.control_speedbrakes_o = None
         self.outside_event_o = None
+        self.bird_o = None
         self.park_brake_o = None
         self.l_throttle_o = None
         self.r_throttle_o = None
@@ -111,6 +115,54 @@ class Echo(metaclass=Singleton):
         self.wind_speed_o = None
         self.elite_hrv_o = None
         self.paused_o = None
+
+    @property
+    def bird_o(self):
+        return self._bird_o
+
+    @bird_o.setter
+    def bird_o(self, value):
+        if hasattr(self, '_bird_o') and self._bird_o == value:
+            return
+        self._bird_o = value
+        if value is not None:
+            igs.output_set_bool("bird", value)
+
+    @property
+    def current_runway_o(self):
+        return self._current_runway_o
+
+    @current_runway_o.setter
+    def current_runway_o(self, value):
+        if hasattr(self, '_current_runway_o') and self._current_runway_o == value:
+            return
+        self._current_runway_o = value
+        if value is not None:
+            igs.output_set_string("current_runway", value)
+
+    @property
+    def runway_centerline_deviation_o(self):
+        return self._runway_centerline_deviation_o
+
+    @runway_centerline_deviation_o.setter
+    def runway_centerline_deviation_o(self, value):
+        if hasattr(self, '_runway_centerline_deviation_o') and self._runway_centerline_deviation_o == value:
+            return
+        self._runway_centerline_deviation_o = value
+        if value is not None:
+            igs.output_set_int("runway-centerline deviation", value)
+
+    @property
+    def heading_deviation_o(self):
+        return self._heading_deviation_o
+
+    @heading_deviation_o.setter
+    def heading_deviation_o(self, value):
+        if hasattr(self, '_heading_deviation_o') and self._heading_deviation_o == value:
+            return
+        self._heading_deviation_o = value
+        if value is not None:
+            igs.output_set_double("heading_deviation", value)
 
     @property
     def airspeed_o(self):

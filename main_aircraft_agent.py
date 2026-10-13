@@ -20,6 +20,7 @@ import tkinter as tk
 import queue as _queue_module
 from collections import Counter
 from joystick_handler import JoystickHandler
+from runway_geometry import detect_runway, runway_deviations, valid_position
 
 # ============= Configuration =============
 JOYSTICK_VERBOSE = True  # Set to True to see detailed joystick button press/release logs
@@ -155,6 +156,35 @@ elite_hrv_entered = False    # True when Elite HRV time has been entered for thi
 eye_tracking_running = False  # Track if eye tracking is running
 last_record_progress = 0.0    # Track last record_progress value to detect if it's increasing
 record_progress_stagnant_time = None  # Time when record progress stopped increasing
+current_runway = None
+runway_ready_at = 0.0
+runway_lock = threading.Lock()
+
+
+def reset_runway_detection():
+    """Discard the previous runway and allow the loaded situation one second to settle."""
+    global current_runway, runway_ready_at
+    with runway_lock:
+        current_runway = None
+        runway_ready_at = time.monotonic() + 1.0
+        agent.current_runway_o = ""
+        agent.runway_centerline_deviation_o = 0
+        agent.heading_deviation_o = 0.0
+
+
+def update_runway_outputs(latitude, longitude, true_heading, sampled_at):
+    """Latch the nearest threshold once, then continuously measure against that runway."""
+    global current_runway
+    with runway_lock:
+        if sampled_at < runway_ready_at or not valid_position(latitude, longitude, true_heading):
+            return
+        if current_runway is None:
+            current_runway = detect_runway(latitude, longitude)
+            print(f"[RUNWAY] Detected {current_runway}")
+        centerline, heading = runway_deviations(current_runway, latitude, longitude, true_heading)
+        agent.runway_centerline_deviation_o = centerline
+        agent.heading_deviation_o = heading
+        agent.current_runway_o = current_runway
 
 def signal_handler(signal_received, frame):
     global is_interrupted, joystick_handler, g1000_mfd_handler, g1000_pfd_handler
@@ -299,7 +329,7 @@ def int_input_callback(io_type, name, value_type, value, my_data):
         send_dref(transfer_knob_dref, value)
     elif name == "alt_sel":
         send_dref(alt_sel_dref, value / 100)  # X-Plane expects altitude in hundreds of feet
-    elif name == "autopilot_heading_set":
+    elif name == "heading_sel":
         send_dref(heading_sel_dref, value)
     elif name == "fuel_boost_l":
         send_dref(fuel_boost_l_dref, value)
@@ -319,8 +349,10 @@ def impulsion_input_callback(io_type, name, value_type, value, my_data):
         print("Resetting simulation...")
         neverDone = True
         agent.outside_event_o = "RESET"
-        send_comm(load_situation_2_comm)
+        agent.bird_o = False
+        send_comm(load_situation_1_comm)
         reset_time = time.time()  # Record the time of reset
+        reset_runway_detection()
         outputs_initialized = False  # Mark that outputs need to be re-initialized
         checklist_check_time = reset_time + 8  # Schedule config check 8s after reset
         checklist_active = False  # Cancel any in-progress checklist
@@ -334,6 +366,7 @@ def impulsion_input_callback(io_type, name, value_type, value, my_data):
         send_comm(clear_master_caution_comm)
     elif name == "bird_strike":
         send_dref(bird_dref, 2)
+        agent.bird_o = True
         print("Birds incoming ! :)")
         agent.outside_event_o = "birds"
     elif name == "flight_director":
@@ -341,10 +374,31 @@ def impulsion_input_callback(io_type, name, value_type, value, my_data):
     elif name == "heading_mode":
         send_comm(heading_mode_comm)
     elif name == "speed_mode":
-        send_dref(airspeedmach_dref, 1)
-        send_comm(speed_mode_comm)
-    elif name == "heading_mode":
-        send_comm(heading_mode_comm)
+        # Read directly: get_dref() returns zero on errors, which is not confirmation.
+        max_attempts = 20
+        try:
+            with xpc.XPlaneConnect() as client:
+                for attempt in range(max_attempts):
+                    if is_interrupted:
+                        print("[SPEED MODE] Interrupted before confirming IAS; command skipped")
+                        return
+                    target = attempt % 2
+                    client.sendDREFs([airspeedmach_dref], [target])
+                    print(f"[SPEED MODE] Attempt {attempt + 1}/{max_attempts}: "
+                          f"wrote {airspeedmach_dref}={target}")
+                    time.sleep(refresh_rate)
+                    result = client.getDREF(airspeedmach_dref)
+                    current = result[0] if isinstance(result, (list, tuple)) else result
+                    print(f"[SPEED MODE] Read {airspeedmach_dref}={current}")
+                    if current == 0:
+                        print("[SPEED MODE] Confirmed IAS (0); sending speed-mode command")
+                        send_comm(speed_mode_comm)
+                        break
+                else:
+                    print(f"[SPEED MODE] Failed to confirm IAS after {max_attempts} attempts; "
+                          "command skipped")
+        except Exception as e:
+            print(f"[SPEED MODE] Actuation/readback failed; command skipped: {e}")
     elif name == "autopilot_master":
         send_comm(autopilot_master_comm)
     elif name == "l_bottle_arm":
@@ -382,7 +436,9 @@ def string_input_callback(io_type, name, value_type, value, my_data):
         # Trigger reset behavior (config checklist check)
         neverDone = True
         agent.outside_event_o = f"LOAD_{value}"
+        agent.bird_o = False
         reset_time = time.time()  # Record the time of reset
+        reset_runway_detection()
         outputs_initialized = False  # Mark that outputs need to be re-initialized
         checklist_check_time = reset_time + 8  # Schedule config check 8s after load
         checklist_active = False  # Cancel any in-progress checklist
@@ -482,6 +538,7 @@ def set_control_inputs(name, value):
 def get_position(alt, heading):
     try:
         # get position
+        sampled_at = time.monotonic()
         with xpc.XPlaneConnect() as client:
             posi = client.getPOSI()
             lat = round(posi[0], 6)  # Latitude
@@ -489,6 +546,8 @@ def get_position(alt, heading):
             pitch = round(posi[3], 2)  # Pitch
             roll = round(posi[4], 2)  # Roll
             # alt and heading come from the main get_drefs batch (no extra socket)
+        # POSI[5] is true heading; preserve the existing magnetic heading output.
+        update_runway_outputs(posi[0], posi[1], posi[5], sampled_at)
     except Exception as e:
         print(f"Error getting position: {e}")
         pitch, roll, lat, long = 0.0, 0.0, 0.0, 0.0
@@ -582,11 +641,16 @@ igs.output_create("verticalSpeed", igs.DOUBLE_T, None)
 igs.output_create("altitude", igs.DOUBLE_T, None)
 igs.output_create("latitude", igs.DOUBLE_T, None)
 igs.output_create("longitude", igs.DOUBLE_T, None)
+igs.output_create("current_runway", igs.STRING_T, None)
+igs.output_create("runway-centerline deviation", igs.INTEGER_T, None)
+igs.output_create("heading_deviation", igs.DOUBLE_T, None)
 igs.output_create("controlThrottle", igs.DOUBLE_T, None)
 igs.output_create("controlFlaps", igs.DOUBLE_T, None)
 igs.output_create("controlGear", igs.DOUBLE_T, None)
 igs.output_create("speedBrakes", igs.DOUBLE_T, None)
 igs.output_create("outsideEvent", igs.STRING_T, None)
+igs.output_create("bird", igs.BOOL_T, False)
+agent.bird_o = False
 igs.output_create("parkBrake", igs.BOOL_T, None)
 igs.output_create("l_throttle", igs.DOUBLE_T, None)
 igs.output_create("r_throttle", igs.DOUBLE_T, None)
@@ -1180,12 +1244,12 @@ def _get_checklist_failures():
     failures = set()
     
     # ⚠⚠⚠ ELITE HRV CHECK - MUST BE FIRST ⚠⚠⚠
-    if not elite_hrv_entered:
-        failures.add("ENTER ELITE HRV TIME")
+    #if not elite_hrv_entered:
+    #    failures.add("ENTER ELITE HRV TIME")
     
     # Eye tracking status check
-    if not eye_tracking_running:
-        failures.add("START EYE TRACKING")
+    #if not eye_tracking_running:
+    #    failures.add("START EYE TRACKING")
     
     # Recording progress check - only flag if stagnant for more than 3 seconds
     if record_progress_stagnant_time is not None:
@@ -1236,6 +1300,9 @@ def _collect_output_values():
         'altitude': getattr(agent, '_altitude_o', None),
         'latitude': getattr(agent, '_latitude_o', None),
         'longitude': getattr(agent, '_longitude_o', None),
+        'current_runway': getattr(agent, '_current_runway_o', None),
+        'runway_centerline_deviation': getattr(agent, '_runway_centerline_deviation_o', None),
+        'heading_deviation': getattr(agent, '_heading_deviation_o', None),
         'control_throttle': getattr(agent, '_control_throttle_o', None),
         'control_flaps': getattr(agent, '_control_flaps_o', None),
         'control_gear': getattr(agent, '_control_gear_o', None),
@@ -1292,6 +1359,7 @@ def _collect_output_values():
         'wind_direction': getattr(agent, '_wind_direction_o', None),
         'wind_speed': getattr(agent, '_wind_speed_o', None),
         'paused': getattr(agent, '_paused_o', None),
+        'bird': getattr(agent, '_bird_o', None),
     }
 
 
@@ -1313,6 +1381,9 @@ def _push_output_values(output_values):
     if output_values['altitude'] is not None: agent.altitude_o = output_values['altitude']
     if output_values['latitude'] is not None: agent.latitude_o = output_values['latitude']
     if output_values['longitude'] is not None: agent.longitude_o = output_values['longitude']
+    if output_values['current_runway'] is not None: agent.current_runway_o = output_values['current_runway']
+    if output_values['runway_centerline_deviation'] is not None: agent.runway_centerline_deviation_o = output_values['runway_centerline_deviation']
+    if output_values['heading_deviation'] is not None: agent.heading_deviation_o = output_values['heading_deviation']
     if output_values['control_throttle'] is not None: agent.control_throttle_o = output_values['control_throttle']
     if output_values['control_flaps'] is not None: agent.control_flaps_o = output_values['control_flaps']
     if output_values['control_gear'] is not None: agent.control_gear_o = output_values['control_gear']
@@ -1369,6 +1440,7 @@ def _push_output_values(output_values):
     if output_values['wind_direction'] is not None: agent.wind_direction_o = output_values['wind_direction']
     if output_values['wind_speed'] is not None: agent.wind_speed_o = output_values['wind_speed']
     if output_values['paused'] is not None: agent.paused_o = output_values['paused']
+    if output_values['bird'] is not None: agent.bird_o = output_values['bird']
 
 
 def resync_igs_outputs():
@@ -1427,6 +1499,7 @@ def main(BirdStrikeEnabled=True):
                 if airspeed[0] >= 110 and neverDone and BirdStrikeEnabled:
                     print("Birds incoming ! :)")
                     send_dref(bird_dref, 2)
+                    agent.bird_o = True
                     agent.outside_event_o = "birds"
                     neverDone = False
                 elif airspeed == 0.0 and not neverDone:
@@ -1523,6 +1596,8 @@ def main(BirdStrikeEnabled=True):
                 now_cl = time.time()
                 if checklist_check_time is not None and now_cl >= checklist_check_time:
                     checklist_check_time = None
+                    send_dref(pitot_heat_dref, 0)  # Force pitot heat OFF to avoid false positives
+                    time.sleep(refresh_rate)
                     failures = _get_checklist_failures()
                     if failures:
                         checklist_last_failures = failures
@@ -1556,8 +1631,8 @@ def main(BirdStrikeEnabled=True):
                 if now - last_full_sync >= FULL_SYNC_INTERVAL:
                     print("[SYNC] Periodic full output resync")
                     resync_igs_outputs()
-                    if yoke_hide[0] == 0:
-                        send_dref(yoke_hide_dref, 1)
+                    #if yoke_hide[0] == 0:
+                    #    send_dref(yoke_hide_dref, 1)
                     last_full_sync = now
         except BaseException as e:
             print(f"[ERROR] An error occurred: {type(e).__name__}: {e}")
